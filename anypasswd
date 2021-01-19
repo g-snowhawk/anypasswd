@@ -1,0 +1,710 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import argparse
+import base64
+import collections
+import hashlib
+import os
+import pwd
+import re
+import readline
+import sys
+import subprocess
+import uuid
+
+from crypt import crypt
+from distutils import spawn
+from getpass import getpass
+from glob import glob
+
+VERSION = '1.0.0'
+USERS_DB = '/etc/passwd'
+GROUP_DB = '/etc/group'
+SHELLS = '/etc/shells'
+overwrite = False
+
+
+def bad_choice(minimum, maximum):
+    msg = 'Choice out of range [{}-{}]\n'
+    sys.stderr.write(msg.format(str(minimum), str(maximum)))
+    sys.exit(1)
+
+
+def die(message):
+    sys.stderr.write("%s\n" % message)
+    sys.exit(1)
+
+
+def user_input(prompt):
+    # Compatible to Python 2.x
+    try:
+        value = raw_input(prompt)
+    except NameError as e:
+        value = input(prompt)
+
+    if type(value) is int:
+        value = str(value)
+
+    return value
+
+
+def is_decimal(n):
+    return re.search(r'^[0-9]+$', n) is not None
+
+
+def validate_uid(uid, default_uid=''):
+    if uid == '' and default_uid != '':
+        uid = default_uid
+
+    try:
+        option = '-un' if is_decimal(uid) else '-u'
+        result = subprocess.check_output(
+            ['id', option, uid], stderr=subprocess.STDOUT).decode().strip()
+        if option == '-u':
+            uid = result
+    except (OSError, subprocess.CalledProcessError) as e:
+        return None
+
+    return uid
+
+
+def validate_gid(gid, default_gid=''):
+    if gid == '' and default_gid != '':
+        gid = default_gid
+
+    try:
+        with open(GROUP_DB, 'r') as f:
+            src = f.read()
+            pattern = '^{}:[^:]+:([^:]+):.*$'
+            if is_decimal(gid):
+                pattern = '^[^:]+:[^:]+:({}):.*$'
+            m = re.search(pattern.format(gid), src, re.MULTILINE)
+            if m is None:
+                raise ValueError('No such group')
+            if gid != m.group(1):
+                gid = m.group(1)
+    except (OSError, ValueError) as e:
+        return None
+
+    return gid
+
+
+def validate_shell(shell, default_shell=''):
+    if shell == '' and default_shell != '':
+        shell = default_shell
+
+    try:
+        if os.path.isfile(SHELLS):
+            with open(SHELLS, 'r') as f:
+                src = f.read()
+                m = re.search('^{}$'.format(shell), src, re.MULTILINE)
+                if m is None:
+                    raise ValueError('Invalid shell')
+    except (OSError, ValueError) as e:
+        return None
+
+    return shell
+
+
+def get_default(name, prop, db, default='', index=None):
+    if db == USERS_DB:
+        try:
+            if prop == 'uid':
+                ps = subprocess.Popen(['id', '-u', name],
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
+                stdout, strerr = ps.communicate()
+                if ps.returncode != 0:
+                    raise OSError(strerr.decode())
+                return stdout.rstrip().decode()
+            if prop == 'gid':
+                ps = subprocess.Popen(['id', '-g', name],
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
+                stdout, strerr = ps.communicate()
+                if ps.returncode != 0:
+                    raise OSError(strerr.decode())
+                return stdout.rstrip().decode()
+        except (OSError, subprocess.CalledProcessError) as e:
+            pass
+
+    try:
+        with open(db, 'r') as f:
+            src = f.read()
+            pattern = '^{}:.+$'
+            m = re.search(pattern.format(name), src, re.MULTILINE)
+            if m is not None:
+                properties = m.group(0).rstrip().split(':')
+                if prop == 'uid':
+                    i = 2
+                elif prop == 'gid':
+                    i = 3 if db != GROUP_DB else 2
+                elif prop == 'dir':
+                    i = 5
+                elif prop == 'shell':
+                    i = 6
+
+                if index is not None:
+                    i = index
+
+                return properties[i]
+    except IOError as e:
+        pass
+
+    return default
+
+
+def accept_passwd():
+    valid = False
+    passwd = None
+    retry = 0
+    max_retry = 3
+
+    while not valid:
+        retry += 1
+        if retry > max_retry:
+            break
+
+        passwd = getpass('Enter new password: ')
+
+        if spawn.find_executable('pwscore') is not None:
+            cmd = "echo '{}' | pwscore".format(passwd.replace("'", "\'"))
+            ps = subprocess.Popen(cmd,
+                                  shell=True,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE).communicate()
+            err = ps[1].decode()
+            if err != '':
+                print(err)
+                continue
+
+            strength = ps[0].decode().strip()
+            # TODO: check the password strength
+        else:
+            try:
+                if len(passwd) < 8:
+                    raise ValueError('The password is shorter '
+                                     'than 8 characters')
+                elif re.search('(.)\1{3,}', passwd, re.IGNORECASE) is not None:
+                    raise ValueError('The same character continues '
+                                     '3 times or more')
+            except ValueError as e:
+                print('Password quality check failed:\n  {}'.format(e))
+                continue
+
+        valid = True
+
+    if valid is False:
+        sys.exit(1)
+
+    return passwd
+
+
+def complete_path(text, state):
+    sugest = glob(text + '*') + [None]
+    path = sugest[state]
+    suffix = ''
+    if os.path.isfile(path):
+        suffix = ' '
+    if os.path.isdir(path):
+        suffix = '/'
+    return path + suffix
+
+
+def yes_or_no(prompt):
+    answer = user_input(prompt).lower()
+    return 'yes' if answer == 'y' or answer == 'yes' else 'no'
+
+
+def remove_user(users, path, typekey):
+    names = []
+    for user in users:
+        names.append(re.escape(user))
+    hint = '(' + '|'.join(names) + '):'
+    suffix = ''
+
+    if typekey == 'digest':
+        realms = realms_for_digest_auth(path, hint)
+        if len(realms) > 0:
+            i = 0
+            print('Which realm:\n')
+            print('  ' + str(i) + '. All realms')
+            for rlm in realms:
+                i += 1
+                print('  ' + str(i) + '. ' + rlm[1])
+            print('')
+            n = user_input('Realm is [0-' + str(i) + ']: ')
+
+            if is_decimal(n):
+                n = int(n)
+            else:
+                bad_choice(1, i)
+
+            if 0 < n <= i:
+                suffix = re.escape(realms[n - 1][1] + ':')
+            elif n == 0:
+                suffixes = []
+                for realm in realms:
+                    suffixes.append(re.escape(realm[1]))
+                suffix = '(' + '|'.join(suffixes) + '):'
+            else:
+                bad_choice(1, i)
+
+    account = 'group' if 'group' in typekey else 'user'
+    update_file(path, '', hint + suffix, True, account)
+
+
+def update_file(path, line, hint, remove=False, account='user'):
+    try:
+        accounts = []
+        pattern = re.compile(hint)
+        replaced = 0
+        if overwrite is False and os.path.exists(path):
+            with open(path, 'r') as f:
+                for ln in f:
+                    if pattern.match(ln):
+                        if remove is False:
+                            accounts.append(line)
+                        replaced += 1
+                    else:
+                        accounts.append(ln.rstrip())
+                f.close()
+
+        if remove and replaced > 0:
+            s = 's' if replaced > 1 else ''
+            prompt = "Remove {} {}{} from `{}' [y/N]: " \
+                     .format(replaced, account, s, path)
+            if yes_or_no(prompt) == 'no':
+                die('Aborted.')
+
+        with open(path, 'w') as f:
+            if replaced == 0:
+                accounts.append(line)
+            src = '\n'.join(accounts)
+            f.write(src)
+    except IOError as e:
+        die(e.strerror)
+
+
+def realms_for_digest_auth(path, prefix='[^:]+:'):
+    try:
+        with open(path, 'r') as f:
+            src = f.read()
+            pattern = re.compile('^' + prefix + '([^:]+):.+$', re.MULTILINE)
+            return sorted(set(pattern.findall(src)))
+    except IOError as e:
+        pass
+
+    return []
+
+
+def generate_salt(digits):
+    return base64.b64encode(os.urandom(digits)).decode('utf-8')[0:digits]
+
+
+def basic_auth(user, passwd, path):
+    salt = generate_salt(8)
+    if spawn.find_executable('openssl') is not None:
+        options = ['openssl', 'passwd', '-apr1', '-salt', salt, passwd]
+        encrypted = subprocess.check_output(options).decode().rstrip()
+    else:
+        encrypted = crypt(passwd, '$1$' + salt + '$')
+
+    if encrypted is None:
+        die('System error!')
+
+    hint = user + ':'
+    line = hint + encrypted
+    update_file(path, line, re.escape(hint))
+
+
+def digest_auth(user, passwd, path):
+    realm = ''
+    realms = realms_for_digest_auth(path)
+    if len(realms) > 0:
+        i = 0
+        print('Which realm:\n')
+        print('  ' + str(i) + '. All realms')
+        for rlm in realms:
+            i += 1
+            print('  ' + str(i) + '. ' + rlm)
+
+        i += 1
+        print('  ' + str(i) + '. Other realm')
+        print('')
+        n = user_input('Realm is [0-' + str(i) + ']: ')
+
+        if is_decimal(n):
+            n = int(n)
+        else:
+            bad_choice(1, i)
+
+        if 0 < n < i:
+            realm = realms[n - 1]
+        elif n == 0:
+            realm = realms
+        elif n == i:
+            pass
+        else:
+            bad_choice(1, i)
+
+    if realm == '':
+        realm = user_input('Realm : ')
+        if realm == '':
+            die('Realm is required!')
+        elif ':' in realm:
+            die("realm contains illegal character ':'")
+
+    if type(realm) is not list:
+        realm = [realm]
+
+    for r in realm:
+        hint = user + ':' + r.strip() + ':'
+        h = hashlib.md5()
+        h.update((hint + passwd).encode('utf-8'))
+        line = hint + h.hexdigest()
+        update_file(path, line, re.escape(hint))
+
+
+def auth_group_file(new_users, path, remove):
+    default_group = ''
+    length = len(new_users)
+    if length > 1 or (remove and length):
+        default_group = new_users[0]
+    group = user_input('Group is {}: '.format('[{}]'.format(default_group)))
+    if default_group != '' and (group == '' or group == default_group):
+        group = new_users.pop(0)
+    elif group == '':
+        die('Group name is required.')
+    if ':' in group:
+        die("Group name contains illegal character ':'")
+
+    users = []
+
+    pattern = re.compile(re.escape(group) + ':(.+)')
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            for ln in f:
+                m = pattern.match(ln)
+                if m:
+                    users = m.group(1).split(' ')
+            f.close()
+    if remove:
+        user_set = list(set(users) - set(new_users))
+    else:
+        users.extend(new_users)
+        user_set = sorted(set(users))
+
+    user_set = [u for u in user_set if u != '']
+    if remove:
+        count = len(user_set)
+        if count == 0 or len(new_users) == 0:
+            remove_user([group], path, 'group')
+            return
+        count = len([a for a in users if a != '']) - count
+        s = 's' if count > 1 else ''
+        prompt = "Remove {} user{} from `{}' [y/N]: " \
+                 .format(count, s, group)
+        if yes_or_no(prompt) == 'no':
+            die('Aborted.')
+
+    hint = group + ':'
+    line = '{}: {}'.format(group, ' '.join(user_set))
+    update_file(path, line, re.escape(hint))
+
+
+def ftpasswd(user, passwd, path):
+    mode = 0o600
+
+    default_uid = get_default(user, 'uid', USERS_DB)
+    default_gid = get_default(user, 'gid', USERS_DB)
+    default_flags = ''
+    default_dir = get_default(user, 'dir', USERS_DB)
+    default_shell = get_default(user, 'shell', USERS_DB)
+    if os.path.isfile(path):
+        default_uid = get_default(user, 'uid', path, default_uid)
+        default_gid = get_default(user, 'gid', path, default_gid)
+        default_dir = get_default(user, 'dir', path, default_dir)
+        default_shell = get_default(user, 'shell', path, default_shell)
+        mode = None
+
+    input_uid = user_input('User ID [{}]: '.format(default_uid))
+    uid = validate_uid(input_uid, default_uid)
+    if uid is None:
+        die("`{}' is no such user.".format(input_uid))
+
+    input_gid = user_input('Group ID [{}]: '.format(default_gid))
+    gid = validate_gid(input_gid, default_gid)
+    if gid is None:
+        die("`{}' is no such group.".format(input_gid))
+
+    flags = ''
+
+    readline.set_completer_delims(' \t\n')
+    readline.parse_and_bind("tab: complete")
+    readline.set_completer(complete_path)
+
+    input_dir = user_input('Home directory [{}]: '.format(default_dir))
+    if input_dir == '':
+        if default_dir == '':
+            die('Home directory is required')
+        input_dir = default_dir
+    homedir = input_dir.rstrip('/')
+    if homedir is None:
+        die("`{}' is no such directory.".format(input_dir))
+
+    input_shell = user_input('Shell [{}]: '.format(default_shell))
+    shell = validate_shell(input_shell, default_shell)
+    if shell is None:
+        die("`{}' is invalid shell.".format(input_shell))
+
+    encrypted = crypt(passwd, '$1$' + generate_salt(8) + '$')
+    if encrypted is None:
+        die('System error!')
+
+    line = ':'.join([user, encrypted, uid, gid, flags, homedir, shell])
+    update_file(path, line, re.escape(user + ':'))
+
+    if mode is not None:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+
+
+def ftpgroup(group, path):
+    default_gid = get_default(group, 'gid', GROUP_DB)
+    if os.path.isfile(path):
+        default_gid = get_default(group, 'gid', path, default_gid, 2)
+
+    input_gid = user_input('Group ID [{}]: '.format(default_gid))
+    gid = validate_gid(input_gid, default_gid)
+    if gid is None:
+        die("`{}' is no such group.".format(input_gid))
+
+    line = ':'.join([group, 'x', gid, ''])
+    update_file(path, line, re.escape(group + ':'))
+
+
+def via_doveadm(scheme, passwd, user=''):
+    if spawn.find_executable('doveadm') is None:
+        return None
+
+    options = ['doveadm', 'pw', '-s', scheme, '-p', passwd]
+    if scheme == 'DIGEST-MD5':
+        options.append('-u')
+        options.append(user)
+
+    return subprocess.check_output(options).rstrip().decode() \
+        .replace('{{{}}}'.format(scheme), '')
+
+
+def dovecot_auth(user, passwd, path):
+    default_uid = get_default(user, 'uid', USERS_DB)
+    default_gid = get_default(user, 'gid', USERS_DB)
+    default_flags = ''
+    default_dir = get_default(user, 'dir', USERS_DB)
+
+    if os.path.isfile(path):
+        default_uid = get_default(user, 'uid', path, default_uid)
+        default_gid = get_default(user, 'gid', path, default_gid)
+        default_dir = get_default(user, 'dir', path, default_dir)
+
+    input_uid = user_input('User ID [{}]: '.format(default_uid))
+    uid = validate_uid(input_uid, default_uid)
+    if uid is None:
+        die("`{}' is no such user.".format(input_uid))
+
+    input_gid = user_input('Group ID [{}]: '.format(default_gid))
+    gid = validate_gid(input_gid, default_gid)
+    if gid is None:
+        die("`{}' is no such group.".format(input_gid))
+
+    flags = ''
+
+    readline.set_completer_delims(' \t\n')
+    readline.parse_and_bind("tab: complete")
+    readline.set_completer(complete_path)
+
+    input_dir = user_input('Home directory [{}]: '.format(default_dir))
+    if input_dir == '':
+        if default_dir == '':
+            die('Home directory is required')
+        input_dir = default_dir
+    homedir = input_dir.rstrip('/')
+
+    schemes = ['SHA1', 'SHA256-CRYPT', 'SHA512-CRYPT', 'MD5']
+    if spawn.find_executable('doveadm') is not None:
+        schemes.append('DIGEST-MD5')
+        schemes.append('CRAM-MD5')
+
+    length = len(schemes)
+    i = 0
+    print('Which scheme:\n')
+    for i in range(length):
+        print('  ' + str(i + 1) + '. ' + schemes[i])
+    print('')
+    n = user_input('scheme is [1-' + str(length) + ']: ')
+
+    if is_decimal(n):
+        n = int(n)
+    elif n == '':
+        n = 0
+    else:
+        bad_choice(1, length)
+
+    if 0 < n <= length:
+        scheme = schemes[n - 1]
+    elif n == 0:
+        scheme = 'PLAIN'
+    else:
+        bad_choice(1, length)
+
+    if scheme == 'PLAIN':
+        encrypted = passwd
+    elif scheme == 'SHA1':
+        encrypted = base64.b64encode(
+            hashlib.sha1(passwd.encode('utf-8')).digest()).decode()
+    elif scheme == 'SHA512-CRYPT':
+        encrypted = crypt(passwd, '$6$' + generate_salt(16) + '$')
+    elif scheme == 'SHA256-CRYPT':
+        encrypted = crypt(passwd, '$5$' + generate_salt(16) + '$')
+    elif scheme == 'MD5':
+        encrypted = crypt(passwd, '$1$' + generate_salt(8) + '$')
+    elif scheme == 'DIGEST-MD5':
+        encrypted = via_doveadm(scheme, passwd, user)
+    elif scheme == 'CRAM-MD5':
+        encrypted = via_doveadm(scheme, passwd)
+    else:
+        die('Scheme is not supported')
+
+    if encrypted is None:
+        die('System error!')
+
+    encrypted_passwd = '{{{}}}{}'.format(scheme, encrypted)
+
+    fields = [user, encrypted_passwd, uid, gid, flags, homedir]
+
+    line = ':'.join(fields)
+    update_file(path, line, re.escape(user + ':'))
+
+
+def main():
+    global overwrite
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--create', action='store_true',
+                        help=('Create new file. '
+                              'If file already exists, '
+                              'it is rewritten and truncated. '
+                              'This option cannot be combined '
+                              'with the -r option'))
+    parser.add_argument('-r', '--remove', action='store_true',
+                        help=('Remove user(s). This option cannot be '
+                              'combined with the -c option'))
+    parser.add_argument('-v', '--version',
+                        action='version',
+                        version='%(prog)s {}'.format(VERSION))
+    parser.add_argument('password_file', type=str,
+                        metavar='/path/to/file',
+                        help='Path to the password file')
+    parser.add_argument('users', nargs='+',
+                        metavar='user',
+                        help=('Command may specify multiple users '
+                              'when using the -r option.'))
+    args = parser.parse_args()
+
+    if args.remove and args.create:
+        die('Invalid options')
+
+    try:
+        if args.remove is True or args.create is False:
+            if os.path.isfile(args.password_file) is False:
+                die(args.password_file + ' is not exists!')
+            # Check permission
+            open(args.password_file)
+        elif args.create is True:
+            if os.path.isfile(args.password_file) is True:
+                print(args.password_file + ' is already exists!')
+                if yes_or_no('Overwrite? [y/N]: ') == 'no':
+                    sys.exit()
+                overwrite = True
+
+            directory = os.path.dirname(args.password_file)
+            if directory == '':
+                directory = '.'
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+    except (IOError, OSError) as e:
+        die(e.strerror)
+
+    if [s for s in args.users if ':' in s]:
+        die("username contains illegal character ':'")
+
+    formats = collections.OrderedDict()
+    formats['basic'] = 'Basic Authentication'
+    formats['digest'] = 'Digest Authentication'
+    formats['group'] = 'Auth Group File'
+    formats['ftpasswd'] = 'ProFTPD passwd'
+    formats['ftpgroup'] = 'ProFTPD group'
+    formats['dovecot'] = 'Dovecot Authentication (passwd-file)'
+
+    types = list(formats.keys())
+    length = len(types)
+
+    print('Select password format:\n')
+    for i in range(length):
+        key = types[i]
+        print('  ' + str(i + 1) + '. ' + formats[key])
+    print('')
+    n = user_input('format is [1-' + str(length) + ']: ')
+
+    if is_decimal(n):
+        n = int(n)
+    else:
+        bad_choice(1, length)
+
+    if 0 < n <= length:
+        pass
+    else:
+        bad_choice(1, length)
+
+    typekey = types[n - 1]
+
+    if typekey == 'group':
+        auth_group_file(args.users, args.password_file, args.remove)
+        sys.exit()
+
+    if args.remove:
+        remove_user(args.users, args.password_file, typekey)
+        sys.exit()
+
+    if typekey == 'ftpgroup':
+        ftpgroup(args.users[0], args.password_file)
+        sys.exit()
+
+    passwd = accept_passwd()
+    retype = str(getpass('Retype new password: '))
+
+    if passwd != retype:
+        die("Password don't match!")
+
+    if typekey == 'basic':
+        basic_auth(args.users[0], passwd, args.password_file)
+    elif typekey == 'digest':
+        digest_auth(args.users[0], passwd, args.password_file)
+    elif typekey == 'ftpasswd':
+        ftpasswd(args.users[0], passwd, args.password_file)
+    elif typekey == 'dovecot':
+        dovecot_auth(args.users[0], passwd, args.password_file)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('')
+    except (IOError) as e:
+        msg = e.strerror if hasattr(e, 'strerror') else e
+        die(msg)
